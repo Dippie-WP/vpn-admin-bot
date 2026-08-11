@@ -1,0 +1,47 @@
+# strongSwan EAP config — template (real config has customer EAP blocks appended)
+# Source: /opt/strongswan-vpn-gateway/docker/swanctl/conf.d/rw-eap.conf
+# Permissions: 0644 root:root
+# Reload after edit: docker exec strongswan swanctl --load-creds
+
+connections {
+    rw-eap {
+        version = 2
+        send_cert = always
+        local_addrs  = 0.0.0.0
+        remote_addrs = %any
+        pools        = rw-pool
+        proposals    = aes256-sha256-modp2048-ecp256,aes128-sha256-modp2048-ecp256
+        unique       = replace
+        rekey_time   = 24h
+        reauth_time  = 4h
+        mobike       = yes
+        fragmentation = yes
+        dpd_delay    = 30s
+        dpd_timeout  = 240s
+        local {
+            auth = pubkey
+            certs = server.cert.pem
+        }
+        remote {
+            auth = eap-radius
+            eap_id = %any
+        }
+        children {
+            rw-eap {
+                local_ts  = 0.0.0.0/0
+                remote_ts = dynamic
+                updown = /usr/local/libexec/ipsec/_updown iptables
+                rekey_time = 4h
+                dpd_action = clear
+                esp_proposals = aes256gcm16-aes256gcm12-aes256gcm8-aes256-sha256,aes256-sha1
+            }
+        }
+    }
+}
+
+secrets {
+    eap-radius {
+        secret = "<RADIUS_CLIENT_SECRET>"
+        server = 127.0.0.1
+    }
+}

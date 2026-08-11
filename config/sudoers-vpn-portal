@@ -1,0 +1,5 @@
+# Allow vpn-portal user to invoke /usr/bin/radclient for CoA/Disconnect kicks.
+# NOPASSWD: required because the bot runs non-interactively from gunicorn workers.
+# Tight scope: only /usr/bin/radclient, not ALL commands. Runas_Alias limited to root.
+# Validated with: sudo visudo -c -f /etc/sudoers.d/vpn-portal
+vpn-portal ALL=(root) NOPASSWD: /usr/bin/radclient

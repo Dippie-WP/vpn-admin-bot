@@ -1,0 +1,5 @@
+# Get this from @BotFather on Telegram: https://t.me/BotFather
+# Run /newbot, follow prompts, copy the token here.
+# Example format: 123456789:AAH1bGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+# After replacing, chmod 600 and chown vpn-portal:vpn-portal
+TELEGRAM_BOT_TOKEN=
