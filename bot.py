@@ -392,7 +392,20 @@ async def cmd_sessions(update, context):
         lines.append(
             f"- `{rid}` `{rip}` -> `{vip}` `{st}` (in:{bi:,} out:{bo:,})"
         )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    # Inline keyboard: one [Disconnect] button per session row.
+    # callback_data fits 64-byte Telegram limit ("disc:" + EAP identity).
+    keyboard = [
+        [InlineKeyboardButton(
+            f"⛔ {s.get('remote_id') or '?'}",
+            callback_data=f"disc:{s.get('remote_id') or '?'}",
+        )]
+        for s in sessions[:25]
+    ]
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def cmd_customers(update, context):
@@ -968,7 +981,31 @@ async def cmd_enable(update, context):
     await update.message.reply_text(f"Enabled customer id=`{cid}`.")
 
 
+def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
+    """Run CoA disconnect via radclient. Returns (success, message).
+
+    Shared between /disconnect (typed) and cb_disconnect (inline button).
+    Sync subprocess blocks the event loop briefly (~10s max) — acceptable
+    for an admin tool with infrequent disconnects.
+    """
+    cmd = [
+        "sudo", "radclient", "127.0.0.1:3799", "coa",
+        "b305c63a5010d2c309e29df7bab0fe66",
+        f"User-Name={eap_identity}",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            return True, f"CoA disconnect sent for `{eap_identity}`."
+        return False, f"Disconnect failed:\n`{(res.stderr or res.stdout).strip()[:500]}`"
+    except subprocess.TimeoutExpired:
+        return False, "Disconnect timed out after 10s."
+    except Exception as e:
+        return False, f"Disconnect error: {e}"
+
+
 async def cmd_disconnect(update, context):
+    """Disconnect an active customer session via CoA (typed command)."""
     if not context.args:
         await update.message.reply_text("Usage: /disconnect <name>")
         return
@@ -986,26 +1023,22 @@ async def cmd_disconnect(update, context):
         await update.message.reply_text(f"No customer matches `{arg}`.")
         return
     eap_identity = rows[0]["eap_identity"]
+    ok, msg = disconnect_via_coa(eap_identity)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-    cmd = [
-        "sudo", "radclient", "127.0.0.1:3799", "coa",
-        "b305c63a5010d2c309e29df7bab0fe66",
-        f"User-Name={eap_identity}",
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if res.returncode == 0:
-            await update.message.reply_text(
-                f"CoA disconnect sent for `{eap_identity}`."
-            )
-        else:
-            await update.message.reply_text(
-                f"Disconnect failed:\n`{(res.stderr or res.stdout).strip()[:500]}`"
-            )
-    except subprocess.TimeoutExpired:
-        await update.message.reply_text("Disconnect timed out after 10s.")
-    except Exception as e:
-        await update.message.reply_text(f"Disconnect error: {e}")
+
+async def cb_disconnect(update, context):
+    """Handle [Disconnect] button press on /sessions inline keyboard.
+
+    callback_data format: "disc:<eap_identity>".
+    """
+    query = update.callback_query
+    await query.answer("Disconnecting…")  # dismisses Telegram loading spinner
+    eap_identity = query.data.split(":", 1)[1]
+    audit("disconnect_inline", eap_identity=eap_identity)
+    ok, msg = disconnect_via_coa(eap_identity)
+    # Edit the original message so the button disappears after action.
+    await _safe_edit_text(query, msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_logs(update, context):
@@ -1145,5 +1178,9 @@ def build_application() -> Application:
     ]
     for cmd, handler in commands:
         application.add_handler(CommandHandler(cmd, handler, filters=whitelist))
+
+    # Inline keyboard callback for /sessions [Disconnect] buttons.
+    # Pattern matches callback_data starting with "disc:" (eap_identity follows).
+    application.add_handler(CallbackQueryHandler(cb_disconnect, pattern=r"^disc:"))
 
     return application
