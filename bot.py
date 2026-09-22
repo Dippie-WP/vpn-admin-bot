@@ -985,19 +985,38 @@ def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
     """Run CoA disconnect via radclient. Returns (success, message).
 
     Shared between /disconnect (typed) and cb_disconnect (inline button).
+
+    Hardening (v2.4.1):
+    - Absolute paths for sudo + radclient (PATH can be stripped in
+      systemd unit environments; bot-polling.service runs as vpn-portal
+      with default systemd PATH that may not include /usr/bin).
+    - Attribute piped via stdin (canonical FreeRADIUS convention). Avoids
+      any edge-case argv parsing that previously produced "Nothing to
+      send" when the user-attribute was empty or malformed.
+    - Return-code surfaced in error message so CoA-NAK (server rejected)
+      is distinguishable from client-side parse failures.
     Sync subprocess blocks the event loop briefly (~10s max) — acceptable
     for an admin tool with infrequent disconnects.
     """
-    cmd = [
-        "sudo", "radclient", "127.0.0.1:3799", "coa",
-        "b305c63a5010d2c309e29df7bab0fe66",
-        f"User-Name={eap_identity}",
-    ]
+    if not eap_identity or eap_identity == "?":
+        return False, "Invalid EAP identity (empty or '?'). Button data malformed."
+    secret = "b305c63a5010d2c309e29df7bab0fe66"
+    cmd = ["/usr/bin/sudo", "/usr/bin/radclient", "127.0.0.1:3799", "coa", secret]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(
+            cmd,
+            input=f"User-Name={eap_identity}\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         if res.returncode == 0:
             return True, f"CoA disconnect sent for `{eap_identity}`."
-        return False, f"Disconnect failed:\n`{(res.stderr or res.stdout).strip()[:500]}`"
+        # Non-zero exit. Capture stderr (preferred) or stdout for the cause.
+        # CoA-NAK (server-side) shows up here as "Expected CoA-ACK got CoA-NAK".
+        # Client-side parse errors show up as "Nothing to send" etc.
+        out = (res.stderr or res.stdout or "<empty>").strip()[:500]
+        return False, f"Disconnect `{eap_identity}` failed (rc={res.returncode}):\n`{out}`"
     except subprocess.TimeoutExpired:
         return False, "Disconnect timed out after 10s."
     except Exception as e:
@@ -1034,7 +1053,8 @@ async def cb_disconnect(update, context):
     """
     query = update.callback_query
     await query.answer("Disconnecting…")  # dismisses Telegram loading spinner
-    eap_identity = query.data.split(":", 1)[1]
+    parts = query.data.split(":", 1)
+    eap_identity = parts[1] if len(parts) > 1 else ""
     audit("disconnect_inline", eap_identity=eap_identity)
     ok, msg = disconnect_via_coa(eap_identity)
     # Edit the original message so the button disappears after action.
