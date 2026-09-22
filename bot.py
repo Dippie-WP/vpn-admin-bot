@@ -982,39 +982,76 @@ async def cmd_enable(update, context):
 
 
 def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
-    """Run CoA disconnect via radclient. Returns (success, message).
+    """Send a Disconnect-Request to charon's DAE plugin (UDP 127.0.0.1:3799).
 
     Shared between /disconnect (typed) and cb_disconnect (inline button).
 
-    Hardening (v2.4.1):
-    - Absolute paths for sudo + radclient (PATH can be stripped in
-      systemd unit environments; bot-polling.service runs as vpn-portal
-      with default systemd PATH that may not include /usr/bin).
-    - Attribute piped via stdin (canonical FreeRADIUS convention). Avoids
-      any edge-case argv parsing that previously produced "Nothing to
-      send" when the user-attribute was empty or malformed.
-    - Return-code surfaced in error message so CoA-NAK (server rejected)
-      is distinguishable from client-side parse failures.
+    Architecture (verified 2026-09-22 13:36 UTC):
+    - charon (NOT FreeRADIUS) owns UDP 3799. FreeRADIUS has NO `coa`
+      virtual server enabled; sites-enabled/ has only `default` +
+      `inner-tunnel`. So CoA/Disconnect packets hit charon's DAE plugin
+      directly, with secret `b305c63a5010d2c309e29df7bab0fe66`
+      (stored in /root/.strongswan-dae-secret, mounted into the
+      strongswan container via 10-eap-radius.conf).
+    - charon's DAE plugin (RFC 5176) matches Disconnect-Request
+      against active IKE_SAs by EITHER Acct-Session-Id OR
+      Framed-IP-Address. User-Name alone does NOT match (charon
+      doesn't keep a User-Name -> IKE_SA index). Calling-Station-Id
+      also doesn't match. This is why the v2.4.0/v2.4.1 bot got
+      CoA-NAK: it sent User-Name only.
+    - Command must be "disconnect" (RFC 5176 Disconnect-Request,
+      code 40), NOT "coa" (CoA-Request, code 43). charon's DAE
+      just NAKs CoA-Request without processing it. quota-monitor.py
+      uses the same Disconnect-Request + Acct-Session-Id pattern.
+
     Sync subprocess blocks the event loop briefly (~10s max) — acceptable
     for an admin tool with infrequent disconnects.
     """
     if not eap_identity or eap_identity == "?":
         return False, "Invalid EAP identity (empty or '?'). Button data malformed."
     secret = "b305c63a5010d2c309e29df7bab0fe66"
-    cmd = ["/usr/bin/sudo", "/usr/bin/radclient", "127.0.0.1:3799", "coa", secret]
+
+    # Build attributes for charon DAE matching. Start with User-Name
+    # (charon uses it for the audit log entry, even if it doesn't match
+    # the IKE_SA). Then look up Acct-Session-Id + Framed-IP-Address
+    # from radacct where the session is still active (acctstoptime IS NULL).
+    attrs = [f"User-Name={eap_identity}"]
+    try:
+        import app
+        rows = app.db_query(
+            "SELECT acctsessionid, framedipaddress FROM radacct "
+            "WHERE username = %s AND acctstoptime IS NULL "
+            "ORDER BY acctstarttime DESC LIMIT 1",
+            (eap_identity,),
+        )
+        if rows:
+            row = rows[0]
+            if row.get("acctsessionid"):
+                attrs.append(f"Acct-Session-Id={row['acctsessionid']}")
+            if row.get("framedipaddress"):
+                attrs.append(f"Framed-IP-Address={row['framedipaddress']}")
+            logger.info(
+                f"disconnect_via_coa: {eap_identity} -> "
+                f"session_id={row.get('acctsessionid')!r} vip={row.get('framedipaddress')!r}"
+            )
+        else:
+            logger.warning(f"disconnect_via_coa: no active radacct row for {eap_identity!r} (will NAK)")
+    except Exception as e:
+        logger.warning(f"disconnect_via_coa: radacct lookup failed: {e}")
+
+    cmd = ["/usr/bin/sudo", "/usr/bin/radclient", "127.0.0.1:3799", "disconnect", secret]
     try:
         res = subprocess.run(
             cmd,
-            input=f"User-Name={eap_identity}\n",
+            input="\n".join(attrs) + "\n",
             capture_output=True,
             text=True,
             timeout=10,
         )
         if res.returncode == 0:
-            return True, f"CoA disconnect sent for `{eap_identity}`."
+            return True, f"Disconnect sent for `{eap_identity}`."
         # Non-zero exit. Capture stderr (preferred) or stdout for the cause.
-        # CoA-NAK (server-side) shows up here as "Expected CoA-ACK got CoA-NAK".
-        # Client-side parse errors show up as "Nothing to send" etc.
+        # Disconnect-NAK (no matching IKE_SA, etc) shows up here.
         out = (res.stderr or res.stdout or "<empty>").strip()[:500]
         return False, f"Disconnect `{eap_identity}` failed (rc={res.returncode}):\n`{out}`"
     except subprocess.TimeoutExpired:
