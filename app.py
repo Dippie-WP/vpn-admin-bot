@@ -58,7 +58,7 @@ import logging
 import asyncio
 import contextlib
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Literal
 import portal_auth  # v1.3.0 customer portal auth + v1.3.1 operator sessions
 
@@ -155,6 +155,15 @@ if os.path.isdir(WWW_DIR):
     @app.get("/portal/", include_in_schema=False)
     def portal_index():
         return FileResponse(os.path.join(WWW_DIR, "portal", "index.html"))
+
+    # TKT-011 v2.0 — Pricing page (deployed to disk 2026-08-19 15:14 UTC,
+    # but the route was missing → 404 publicly). Add the 2 routes so the
+    # public Cloudflare-proxied URL https://vpn-portal.databyte.co.za/pricing
+    # actually serves the page customers need to see tiers + prices.
+    @app.get("/pricing", include_in_schema=False)
+    @app.get("/pricing.html", include_in_schema=False)
+    def pricing_page():
+        return FileResponse(os.path.join(WWW_DIR, "pricing.html"))
 
 # ---------- Session cleanup (HIGH #3 fix) ----------
 # Both purge_expired_sessions() (customer) and purge_expired_operator_sessions()
@@ -301,6 +310,45 @@ def db_exec(sql: str, params=None) -> None:
     with portal_auth._db() as conn:
         conn.execute(sql, params or ())
         conn.commit()
+
+def recent_sessions(limit: int = 2, exclude_usernames=None, lookback_days: int = 7) -> list:
+    """Return the N most recently closed sessions from radacct, with each
+    distinct username represented at most once (latest session only).
+    Excludes any usernames in exclude_usernames (live users).
+    Limited to sessions whose AcctStopTime is within the last lookback_days
+    (default 7). Cutoff uses AcctStopTime (when the session ended).
+
+    Used by /sessions bot command to show recent history without
+    duplicating users when one has multiple recent sessions.
+    Returns list of dicts with: UserName, FramedIPAddress, AcctStartTime,
+    AcctStopTime, AcctSessionTime, AcctInputOctets, AcctOutputOctets.
+    """
+    from datetime import datetime, timezone, timedelta
+    exclude_usernames = exclude_usernames or []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).replace(tzinfo=None)
+    base_select = (
+        "SELECT r.UserName, r.FramedIPAddress, r.AcctStartTime, r.AcctStopTime, "
+        "       r.AcctSessionTime, r.AcctInputOctets, r.AcctOutputOctets "
+        "FROM radacct r "
+        "INNER JOIN ("
+        "    SELECT UserName, MAX(AcctStopTime) AS latest_stop "
+        "    FROM radacct "
+        "    WHERE AcctStopTime IS NOT NULL AND AcctStopTime >= ? "
+        "    GROUP BY UserName"
+        ") latest "
+        "  ON r.UserName = latest.UserName AND r.AcctStopTime = latest.latest_stop "
+        "WHERE r.AcctStopTime IS NOT NULL AND r.AcctStopTime >= ? "
+    )
+    if exclude_usernames:
+        placeholders = ",".join("?" * len(exclude_usernames))
+        sql = base_select + f"AND r.UserName NOT IN ({placeholders}) " + "ORDER BY r.AcctStopTime DESC LIMIT ?"
+        params = (cutoff, cutoff) + tuple(exclude_usernames) + (int(limit),)
+    else:
+        sql = base_select + "ORDER BY r.AcctStopTime DESC LIMIT ?"
+        params = (cutoff, cutoff, int(limit))
+    return db_query(sql, params)
+
+
 
 
 # ---------- charon / ipBan / firewalld wrappers ----------
@@ -702,6 +750,7 @@ class WhitelistAddRequest(BaseModel):
 DEVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]{0,31}$")
 SLUG_RE        = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$")  # customers.name + users.name
 EMAIL_RE       = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")          # RFC 5322 lite
+MAC_RE         = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")  # TKT-011 v2.0 — 2 MACs per user (#37687 §e)
 RW_EAP_CONF    = os.environ.get("RW_EAP_CONF",        "/home/zunaid/strongswan/swanctl/conf.d/rw-eap.conf")
 BACKUP_DIR     = os.environ.get("RW_EAP_BACKUP_DIR",   "/home/zunaid/strongswan/swanctl/conf.d/.backups")
 ALLOWED_DEVICE_TYPES = {"iOS", "Android", "Windows", "macOS", "Linux", "Other"}
@@ -728,68 +777,58 @@ def read_rw_eap_conf(_ssh=None) -> str:
     except HTTPException:
         return ""
 
-
 def write_rw_eap_conf(content: str, _ssh=None) -> None:
-    """Atomic write: backup + temp file + size validate + atomic rename.
+    """Thin wrapper around the shared atomic-write helper (TKT-002 single source of truth).
 
-    2026-08-10 fix: the old implementation used 'cat > FILE' via stdin, which
-    silently truncated the file when the SSH connection was interrupted mid-
-    write (verified — the iPhone auth outage at 08:39 SAST was caused by this).
-    New flow:
-      1. Backup current file to BACKUP_DIR (safety net)
-      2. Write the new content to <FILE>.tmp-<ts> via SSH
-      3. Validate the temp file size matches the expected byte count
-      4. mv the temp file over the original (POSIX atomic rename on same FS)
-      5. Verify the final file size matches what we intended to write
-    On any size mismatch we refuse to overwrite the live conf and raise HTTPException.
+    2026-08-11: the previous in-line atomic-write logic was copy-pasted into 3
+    OTHER writers (quota-monitor kill, update_rw_eap_conf, rotate-vpn-credentials)
+    — each had subtle differences and most did not match this one's safety
+    guarantees. We now route every writer through one helper. This function:
+      - preserves the `_ssh` injection point for tests (matches conftest mock)
+      - translates SafeWriteError (helper exception) → HTTPException for FastAPI
 
-    _ssh: injectable transport for tests. Defaults to _run_remote (real SSH).
-    Production callers omit it; tests pass a mock that simulates SSH responses.
+    Algorithm (helper does the real work — see host/safe_write_rw_eap.py):
+      1. mkdir backup_dir + cp current → <conf>.bak-<label>-<ts>
+      2. tee content → <conf>.tmp-<label>-<ts>
+      3. stat temp; if size != expected, rm temp + raise (no live write)
+      4. mv temp → conf_path (POSIX atomic rename on same FS)
+      5. stat final; verify size matches
+
+    On any size mismatch the live conf is NEVER opened in 'w' mode.
     """
+    # Bootstrap shared helper import (one-time per import). The portal is
+    # relocated from `host/vpn-portal/` on OC to `/opt/vpn-portal/` on VPS,
+    # so the helper lives at a different relative location — check both.
+    import sys
+    from pathlib import Path as _Path
+    _HELPER_CANDIDATES = (
+        "/opt/strongswan-vpn-gateway/host",                       # VPS canonical
+        str(_Path(__file__).resolve().parent.parent),             # OC dev
+    )
+    for _cand in _HELPER_CANDIDATES:
+        if _Path(_cand, "safe_write_rw_eap.py").exists():
+            if _cand not in sys.path:
+                sys.path.insert(0, _cand)
+            break
+    else:
+        raise ImportError(
+            "safe_write_rw_eap.py not found in: "
+            + ", ".join(_HELPER_CANDIDATES)
+            + " (TKT-002 single source of truth is missing)"
+        )
+    from safe_write_rw_eap import atomic_write_conf_remote, SafeWriteError
+
     ssh = _ssh if _ssh is not None else _run_remote
-    ts = int(time.time())
-    backup_path = f"{BACKUP_DIR}/rw-eap.conf.bak-portal-{ts}"
-    tmp_path = f"{RW_EAP_CONF}.tmp-{ts}"
-    content_bytes = content.encode()
-    expected_size = len(content_bytes)
-
-    # 1. Backup current file
-    ssh(["mkdir", "-p", BACKUP_DIR])
-    ssh(["cp", RW_EAP_CONF, backup_path])
-
-    # 2. Write to temp file via SSH (stdin piped via stdin_data)
     try:
-        ssh(["cat > " + tmp_path], stdin_data=content_bytes)
-    except HTTPException:
-        ssh(["rm", "-f", tmp_path])  # cleanup on write failure
-        raise
-
-    # 3. Validate temp file size matches expected (the critical new check)
-    try:
-        stat_out = ssh(["stat", "-c", "%s", tmp_path])
-        actual_size = int(stat_out.strip())
-    except (ValueError, AttributeError, HTTPException) as e:
-        ssh(["rm", "-f", tmp_path])
-        raise HTTPException(502, f"could not stat temp file: {e!r}")
-    if actual_size != expected_size:
-        ssh(["rm", "-f", tmp_path])
+        atomic_write_conf_remote(
+            content, ssh, RW_EAP_CONF, BACKUP_DIR, caller_label="portal"
+        )
+    except SafeWriteError as e:
         raise HTTPException(
             502,
-            f"temp file size mismatch: expected {expected_size} bytes, got {actual_size}. "
-            f"SSH write was likely truncated. Refusing to overwrite production conf."
+            f"rw-eap.conf write aborted (size mismatch refused): {e}",
         )
 
-    # 4. Atomic rename (POSIX guarantees atomicity on same filesystem)
-    ssh(["mv", tmp_path, RW_EAP_CONF])
-
-    # 5. Verify final file size on disk
-    final_size = int(ssh(["stat", "-c", "%s", RW_EAP_CONF]).strip())
-    if final_size != expected_size:
-        raise HTTPException(
-            502,
-            f"final file size mismatch: expected {expected_size}, got {final_size}. "
-            f"Atomic rename may have failed silently."
-        )
 
 
 def reload_charon_creds() -> None:
@@ -850,7 +889,7 @@ def eap_block_exists(identity: str) -> bool:
     return bool(re.search(rf"^\s*{re.escape(block_id)}\s*\{{", conf, re.MULTILINE))
 
 
-def ensure_tier(name: str, display_name: str, data_limit_bytes: int) -> int:
+def ensure_tier(name: str, display_name: str) -> int:
     """Look up tier by name; if missing, create it. Return tier_id.
 
     Used by POST /api/customers when the operator picks a custom cap on the fly.
@@ -863,8 +902,8 @@ def ensure_tier(name: str, display_name: str, data_limit_bytes: int) -> int:
         return rows[0]["id"]
     ts = int(time.time())
     db_exec(
-        f"INSERT INTO tiers (name, display_name, data_limit_bytes, price_zar, is_active, created_at, notes) "
-        f"VALUES ({_q(name)}, {_q(display_name)}, {int(data_limit_bytes)}, NULL, 1, {ts}, "
+        f"INSERT INTO tiers (name, display_name, price_zar, is_active, created_at, notes) "
+        f"VALUES ({_q(name)}, {_q(display_name)}, NULL, 1, {ts}, "
         f"{_q('auto-created by v1.2.7 portal onboarding')});"
     )
     new = db_query(f"SELECT id FROM tiers WHERE name = {_q(name)};")
@@ -944,8 +983,13 @@ class ClientCreate(BaseModel):
     email:            Optional[str] = Field(None, max_length=128)
     telegram_username: Optional[str] = Field(None, max_length=64)
     notes:            Optional[str] = Field(None, max_length=1024)
+    # TKT-011 v2.0 — 2 MACs per user for ALL packages (#37687 §e)
+    mac_address_1:    Optional[str] = Field(None, max_length=17,
+                                           description="First registered MAC (XX:XX:XX:XX:XX:XX). Stored in customers.mac_address_1.")
+    mac_address_2:    Optional[str] = Field(None, max_length=17,
+                                           description="Second registered MAC (XX:XX:XX:XX:XX:XX). Stored in customers.mac_address_2.")
     # Tier — either existing tier_name OR 'custom' with custom_cap_mb
-    tier_name:        str           = Field(..., description="Existing tier name (e.g. 'tier_5gb', 'tier_10gb', 'tier_20gb') OR 'custom'")
+    tier_name:        str           = Field(..., description="Existing tier name (e.g. 'paid_7day_10', 'demo_3day_10') OR 'custom'")
     custom_cap_mb:    Optional[int] = Field(None, ge=1, le=1024*1024,
                                            description="Cap in MiB. Required iff tier_name=='custom'")
     # v1.5.0 — Speed plan (per-customer, NOT tier-driven). Two preset options:
@@ -1178,6 +1222,9 @@ def list_customers(
                c.is_active, c.status, c.data_used_bytes, c.data_limit_bytes,
                c.over_quota, c.billing_id, c.email, c.max_devices,
                c.bandwidth_down_mbps, c.bandwidth_up_mbps,
+               c.expires_at, c.mac_address_1, c.mac_address_2,
+               c.total_session_time_seconds, c.active_days_count,
+               c.last_session_at, c.last_session_duration_seconds,
                t.name AS tier_name, t.display_name AS tier_display,
                t.data_limit_bytes AS tier_limit
         FROM customers c
@@ -1214,6 +1261,15 @@ def list_customers(
             "quota_bytes": quota,
             "pct": round(used / quota * 100, 1) if quota else 0,
             "over_quota": bool(r["over_quota"]),
+            # TKT-011 v2.0 — time-based expiry + 2 MACs per user (#37687 §e)
+            "expires_at":   r["expires_at"],
+            "mac_address_1": r["mac_address_1"],
+            "mac_address_2": r["mac_address_2"],
+            # TKT-011 v2.0 — time tracking, populated by quota-monitor from radacct (#37716)
+            "total_session_time_seconds":    r["total_session_time_seconds"] or 0,
+            "active_days_count":             r["active_days_count"] or 0,
+            "last_session_at":               r["last_session_at"],
+            "last_session_duration_seconds": r["last_session_duration_seconds"],
         })
     return out
 
@@ -1273,6 +1329,12 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
     if req.email and not EMAIL_RE.match(req.email):
         raise HTTPException(400, f"email '{req.email}' is not a valid address")
 
+    # TKT-011 v2.0 — MAC validation (2 MACs per user #37687 §e)
+    if req.mac_address_1 and not MAC_RE.match(req.mac_address_1):
+        raise HTTPException(400, f"mac_address_1 '{req.mac_address_1}' is not a valid MAC (XX:XX:XX:XX:XX:XX)")
+    if req.mac_address_2 and not MAC_RE.match(req.mac_address_2):
+        raise HTTPException(400, f"mac_address_2 '{req.mac_address_2}' is not a valid MAC (XX:XX:XX:XX:XX:XX)")
+
     if req.device_type not in ALLOWED_DEVICE_TYPES:
         raise HTTPException(400, f"device_type must be one of {sorted(ALLOWED_DEVICE_TYPES)}")
 
@@ -1320,21 +1382,24 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
     )
     validate_bandwidth(bandwidth_down_mbps, bandwidth_up_mbps)
 
+    # TKT-011 v2.0 — initialize duration_days so it's defined for both
+    # tier branches (custom tier has no duration; existing tier fills it below).
+    duration_days = None
+
     # 2. Resolve tier
     if req.tier_name == "custom":
         ts = int(time.time())
         tier_name = f"custom_{req.custom_cap_mb}mb_{ts}"
         tier_display = f"Custom {req.custom_cap_mb} MiB"
-        data_limit = req.custom_cap_mb * 1024 * 1024  # binary MiB
-        tier_id = ensure_tier(tier_name, tier_display, data_limit)
+        tier_id = ensure_tier(tier_name, tier_display)
     else:
-        rows = db_query(f"SELECT id, data_limit_bytes, is_active FROM tiers WHERE name = {_q(req.tier_name)};")
+        rows = db_query(f"SELECT id, duration_days, is_active FROM tiers WHERE name = {_q(req.tier_name)};")
         if not rows:
             raise HTTPException(400, f"tier '{req.tier_name}' does not exist")
         if not rows[0].get("is_active"):
             raise HTTPException(400, f"tier '{req.tier_name}' is archived")
         tier_id = rows[0]["id"]
-        data_limit = rows[0]["data_limit_bytes"]
+        duration_days = rows[0].get("duration_days")  # TKT-011 v2.0 — for expires_at
         tier_name = req.tier_name
         tier_display = None
 
@@ -1351,6 +1416,11 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
     ntlm = ntlm_hash_bytes(password)
     now = int(time.time())
 
+    # TKT-011 v2.0 — expires_at = NOW() + duration_days (Q1=(a) Reset semantics)
+    expires_at = None
+    if duration_days is not None:
+        expires_at = (datetime.utcnow() + timedelta(days=int(duration_days))).strftime("%Y-%m-%d %H:%M:%S")
+
     # We insert customers + users + devices; on failure of 7-8, we need to roll
     # back DB rows. SQLite here is just files via SSH; we have no transaction
     # support over the boundary. Compensate by deleting in reverse on later
@@ -1365,12 +1435,14 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
             try:
                 wrapped.execute(
                     "INSERT INTO customers (name, display_name, telegram_username, is_operator, is_active, "
-                    "over_quota, data_limit_bytes, data_used_bytes, tier_id, status, max_devices, "
+                    "data_used_bytes, expires_at, mac_address_1, mac_address_2, "
+                    "tier_id, status, max_devices, "
                     "bandwidth_down_mbps, bandwidth_up_mbps, "
                     "created_at, updated_at, notes, billing_id, email) VALUES "
-                    "(?, ?, ?, 0, 1, 0, ?, 0, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?)",
+                    "(?, ?, ?, 0, 1, 0, ?, ?, ?, ?, 'active', 2, ?, ?, ?, ?, ?, ?, ?)",
                     (cust_name, req.display_name, req.telegram_username,
-                     int(data_limit), int(tier_id),
+                     expires_at, req.mac_address_1, req.mac_address_2,
+                     int(tier_id),
                      int(bandwidth_down_mbps), int(bandwidth_up_mbps),
                      now, now, req.notes, req.billing_id, req.email)
                 )
@@ -1465,6 +1537,81 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
     })
 
     # 10. Return one-shot response
+    # TKT-011 v2.0 — admin-mediated flow: Zun creates customer via portal →
+    # bot sends creds to customer's telegram_username. Mock token = no-op.
+    if req.telegram_username:
+        try:
+            import bot as bot_module
+            bot_module.send_credentials_sync(
+                telegram_id=req.telegram_username,
+                eap_identity=eap_identity,
+                password=password,
+                tier_display=tier_display or tier_name,
+            )
+        except Exception as e:
+            log.error(f"[CT_CRED_SEND_FAIL] bot.send_credentials failed: {e}")
+            log.exception("bot.send_credentials full traceback:")
+
+    # TKT-011 v2.0 — admin-mediated flow: Zun creates customer via portal →
+    # bot sends creds to customer's telegram_username. Mock token = no-op.
+    if req.telegram_username:
+        try:
+            import bot as bot_module
+            bot_module.send_credentials_sync(
+                telegram_id=req.telegram_username,
+                eap_identity=eap_identity,
+                password=password,
+                tier_display=tier_display or tier_name,
+            )
+        except Exception as e:
+            log.error(f"[CT_CRED_SEND_FAIL] bot.send_credentials failed: {e}")
+            log.exception("bot.send_credentials full traceback:")
+
+    # TKT-011 v2.0 — admin-mediated flow: Zun creates customer via portal →
+    # bot sends creds to customer's telegram_username. Mock token = no-op.
+    if req.telegram_username:
+        try:
+            import bot as bot_module
+            bot_module.send_credentials_sync(
+                telegram_id=req.telegram_username,
+                eap_identity=eap_identity,
+                password=password,
+                tier_display=tier_display or tier_name,
+            )
+        except Exception as e:
+            log.error(f"[CT_CRED_SEND_FAIL] bot.send_credentials failed: {e}")
+            log.exception("bot.send_credentials full traceback:")
+
+    # TKT-011 v2.0 — admin-mediated flow: Zun creates customer via portal →
+    # bot sends creds to customer's telegram_username. Mock token = no-op.
+    if req.telegram_username:
+        try:
+            import bot as bot_module
+            bot_module.send_credentials_sync(
+                telegram_id=req.telegram_username,
+                eap_identity=eap_identity,
+                password=password,
+                tier_display=tier_display or tier_name,
+            )
+        except Exception as e:
+            log.error(f"[CT_CRED_SEND_FAIL] bot.send_credentials failed: {e}")
+            log.exception("bot.send_credentials full traceback:")
+
+    # TKT-011 v2.0 — admin-mediated flow: Zun creates customer via portal →
+    # bot sends creds to customer's telegram_username. Mock token = no-op.
+    if req.telegram_username:
+        try:
+            import bot as bot_module
+            bot_module.send_credentials_sync(
+                telegram_id=req.telegram_username,
+                eap_identity=eap_identity,
+                password=password,
+                tier_display=tier_display or tier_name,
+            )
+        except Exception as e:
+            log.error(f"[CT_CRED_SEND_FAIL] bot.send_credentials failed: {e}")
+            log.exception("bot.send_credentials full traceback:")
+
     return {
         "customer": {
             "id":             cust_id,
@@ -1477,10 +1624,12 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
             "tier_display":   tier_display,
             "is_active":      True,
             "is_operator":    False,
-            "max_devices":    1,
+            "max_devices":    2,  # TKT-011 v2.0 — 2 MACs per user (#37687 §e)
             "status":         "active",
             "data_used_bytes": 0,
-            "data_limit_bytes": data_limit,
+            "expires_at":     expires_at,        # TKT-011 v2.0
+            "mac_address_1":  req.mac_address_1, # TKT-011 v2.0
+            "mac_address_2":  req.mac_address_2, # TKT-011 v2.0
             "notes":          req.notes,
             "created_at":     now,
             "updated_at":     now,
@@ -1509,6 +1658,9 @@ def get_customer(customer_id: int, _: dict = Depends(require_session)):
                c.data_limit_bytes, c.over_quota, c.notes, c.created_at, c.updated_at,
                c.billing_id, c.email,
                c.bandwidth_down_mbps, c.bandwidth_up_mbps, c.max_devices,
+               c.expires_at, c.mac_address_1, c.mac_address_2,
+               c.total_session_time_seconds, c.active_days_count,
+               c.last_session_at, c.last_session_duration_seconds,
                t.name AS tier_name, t.display_name AS tier_display,
                t.data_limit_bytes AS tier_limit
         FROM customers c
@@ -1588,14 +1740,33 @@ def get_customer(customer_id: int, _: dict = Depends(require_session)):
 
 @app.get("/api/tiers")
 def list_tiers(_: dict = Depends(require_session)):
+    """List all tiers (active + archived).
+
+    TKT-011 v2.0: returns duration_days + speed_tier (NEW) alongside the legacy
+    quota_bytes (kept for backward compat). New packages:
+      - duration_days IS NOT NULL → v2.0 time-based (3 demo + 6 paid × 3 speeds = 20)
+      - duration_days IS NULL     → legacy data-cap (tier_5gb/10gb/20gb/demo_100mb
+                                     + custom_* tiers)
+    Sort: v2.0 first by duration_days asc, then speed_tier (10_10 → 20_20 → unlimited);
+    legacy data-cap tiers last by data_limit_bytes.
+    """
     rows = db_query("""
-        SELECT id, name, display_name, data_limit_bytes, price_zar, is_active, notes
-        FROM tiers ORDER BY data_limit_bytes;
+        SELECT id, name, display_name, data_limit_bytes, duration_days, speed_tier,
+               price_zar, is_active, notes
+        FROM tiers
+        ORDER BY (duration_days IS NULL) ASC,
+                 duration_days ASC,
+                 FIELD(speed_tier, '10_10', '20_20', 'unlimited'),
+                 data_limit_bytes;
     """)
     return [{
         "id": r["id"],
         "name": r["name"],
         "display_name": r["display_name"],
+        # v2.0 fields (NULL for legacy data-cap tiers) — TKT-011
+        "duration_days": r["duration_days"],
+        "speed_tier": r["speed_tier"],
+        # legacy data-cap quota (kept for backward compat) — TKT-011 deprecated
         "quota_bytes": r["data_limit_bytes"],
         "price_zar": r["price_zar"],
         "is_active": bool(r["is_active"]),
@@ -2227,6 +2398,9 @@ class CustomerUpdate(BaseModel):
     tier_name: Optional[str] = None  # change tier
     custom_cap_mb: Optional[int] = None  # if tier_name='custom'
     max_devices: Optional[int] = None  # 1..10
+    # TKT-011 v2.0 — 2 MACs per user (#37687 §e). Empty string clears the MAC.
+    mac_address_1: Optional[str] = None
+    mac_address_2: Optional[str] = None
     # v1.7.0 — speed_plan in PATCH. Per-customer bandwidth preset.
     # 'standard'         → 20/20 mbps symmetric
     # 'asymmetric_40_20' → 40 down / 20 up
@@ -2304,6 +2478,21 @@ def update_customer(customer_id: int, req: CustomerUpdate, user: dict = Depends(
         if req.email and not EMAIL_RE.match(req.email):
             raise HTTPException(400, f"email '{req.email}' is not a valid address")
         sets.append(f"email = {_q(req.email)}")
+    # TKT-011 v2.0 — MAC validation + write (2 MACs per user #37687 §e)
+    if req.mac_address_1 is not None and req.mac_address_1 and not MAC_RE.match(req.mac_address_1):
+        raise HTTPException(400, f"mac_address_1 '{req.mac_address_1}' is not a valid MAC (XX:XX:XX:XX:XX:XX)")
+    if req.mac_address_2 is not None and req.mac_address_2 and not MAC_RE.match(req.mac_address_2):
+        raise HTTPException(400, f"mac_address_2 '{req.mac_address_2}' is not a valid MAC (XX:XX:XX:XX:XX:XX)")
+    if req.mac_address_1 is not None:
+        if req.mac_address_1:
+            sets.append(f"mac_address_1 = {_q(req.mac_address_1)}")
+        else:
+            sets.append("mac_address_1 = NULL")
+    if req.mac_address_2 is not None:
+        if req.mac_address_2:
+            sets.append(f"mac_address_2 = {_q(req.mac_address_2)}")
+        else:
+            sets.append("mac_address_2 = NULL")
     if req.billing_id is not None:
         sets.append(f"billing_id = {_q(req.billing_id)}")
     if req.notes is not None:
@@ -2347,24 +2536,27 @@ def update_customer(customer_id: int, req: CustomerUpdate, user: dict = Depends(
 
     # Tier change
     if req.tier_name is not None:
+        duration_days = None  # TKT-011 v2.0 — for expires_at (Q1=(a) Reset)
         if req.tier_name == "custom":
             if req.custom_cap_mb is None or req.custom_cap_mb < 1:
                 raise HTTPException(400, "custom_cap_mb (>=1) is required when tier_name='custom'")
             ts = int(time.time())
             tier_name = f"custom_{req.custom_cap_mb}mb_{ts}"
             tier_display = f"Custom {req.custom_cap_mb} MiB"
-            data_limit = req.custom_cap_mb * 1024 * 1024
-            tier_id = ensure_tier(tier_name, tier_display, data_limit)
+            tier_id = ensure_tier(tier_name, tier_display)
+            # duration_days stays None — legacy custom tier
         else:
-            rows = db_query(f"SELECT id, data_limit_bytes, is_active FROM tiers WHERE name = {_q(req.tier_name)};")
+            rows = db_query(f"SELECT id, duration_days, is_active FROM tiers WHERE name = {_q(req.tier_name)};")
             if not rows:
                 raise HTTPException(400, f"tier '{req.tier_name}' does not exist")
             if not rows[0].get("is_active"):
                 raise HTTPException(400, f"tier '{req.tier_name}' is archived")
             tier_id = rows[0]["id"]
-            data_limit = rows[0]["data_limit_bytes"]
+            duration_days = rows[0].get("duration_days")
         sets.append(f"tier_id = {int(tier_id)}")
-        sets.append(f"data_limit_bytes = {int(data_limit)}")
+        # TKT-011 v2.0 — Q1=(a) Reset: expires_at = NOW() + duration_days (treat as new purchase)
+        if duration_days is not None:
+            sets.append(f"expires_at = DATE_ADD(NOW(), INTERVAL {int(duration_days)} DAY)")
 
     if not sets:
         # v1.7.0 — speed_plan='custom' sent standalone is a meaningful no-op
@@ -3043,28 +3235,45 @@ async def telegram_webhook(secret: str, request: Request):
 
     data = await request.json()
     update = Update.de_json(data, bot_app.bot)
-    # Manual dispatch: bypass PTB v22 dispatcher entirely.
-    # Application.process_update() and update_queue.put() silently return
-    # without invoking handlers in this build — root cause of bot appearing
-    # dead. We iterate handler groups, run check_update on each, and invoke
-    # matching handlers directly.
+    # v2.6.4 fix: PTB 22 Application calls check_update synchronously inside an async
+    # context (process_update). When MultiWorkerConversationHandler.check_update is async
+    # (to await the MariaDB persistence load on cache miss), the result is a coroutine.
+    # Await it before passing to handle_update so ConversationHandler.handle_update can
+    # unpack check_result into (current_state, key, handler, handler_check_result)
+    # without TypeError: cannot unpack non-iterable coroutine object.
     log.info(f"telegram webhook update_id={update.update_id} chat_id={update.effective_chat.id if update.effective_chat else None}")
     log.info(f"telegram webhook update_id={update.update_id} eff_user={(update.effective_user.id, update.effective_user.username) if update.effective_user else None}")
     log.info(f"telegram webhook update_id={update.update_id} eff_msg_text={update.effective_message.text if update.effective_message else None}")
-    context = bot_app.context_types.context.from_update(update, bot_app)
-    await context.refresh_data()
+    # PTB's standard dispatcher: creates a Context, calls refresh_data,
+    # iterates handler groups, invokes matching handlers (including
+    # ConversationHandler state transitions), and flushes persistence at
+    # the end. This replaces the v2.4.0-v2.4.4 manual dispatch loop, which
+    # failed to properly drive ConversationHandler state across webhook
+    # calls (the manual `break` after first match + custom loop skipped
+    # ConversationHandler's internal state tracking, and even adding
+    # bot_app.update_persistence() didn't recover the conversation state).
+    # The original comment claiming process_update() 'silently returns
+    # without invoking handlers' was true for a prior PTB build; on
+    # PTB 22.8 the standard dispatcher works correctly.
     handlers_fired = 0
-    for handlers in [v.copy() for v in bot_app.handlers.values()]:
-        for handler in handlers:
-            check = handler.check_update(update)
-            log.info(f"telegram webhook update_id={update.update_id} handler={type(handler).__name__} check={check}")
-            if check is None or check is False:
-                continue
-            try:
-                await handler.handle_update(update, bot_app, check, context)
-                handlers_fired += 1
-            except Exception as e:
-                log.exception(f"telegram webhook handler {type(handler).__name__} raised: {e}")
-            break
-    log.info(f"telegram webhook update_id={update.update_id} handlers_fired={handlers_fired}")
+    try:
+        await bot_app.process_update(update)
+        # process_update internally tracks which handlers fired; for the
+        # log below we approximate by checking whether the update was an
+        # effective_message or callback_query (bot always responds to both).
+        handlers_fired = 1
+    except Exception as e:
+        log.exception(f"telegram webhook bot_app.process_update raised: {e}")
+    log.info(f"telegram webhook update_id={update.update_id} processed (handlers_fired={handlers_fired})")
     return {"ok": True, "handlers_fired": handlers_fired}
+
+
+# TKT-011 v2.0 — start Telegram bot in background thread (admin-mediated flow).
+# Bot.send_credentials_sync() is called from create_client() after a customer
+# is created. Mock token check: if TELEGRAM_TOKEN starts with 'MOCK_' or
+# contains 'TOKEN_REPLACE_ME', the actual send is skipped (logs only).
+try:
+    import bot
+    bot.start_bot_thread()
+except Exception as e:
+    log.error(f"bot startup failed: {e}")

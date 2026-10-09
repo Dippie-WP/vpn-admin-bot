@@ -1,0 +1,20 @@
+# Databyte VPN portal + bot dependencies (app.py + bot.py).
+# Derived from `import` lines; pinned to current stable.
+# Not in git repo by design — written to OC controller filesystem
+# so ansible.builtin.copy can sync it to target hosts.
+
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+gunicorn==23.0.0
+pydantic==2.9.2
+python-multipart==0.0.20
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.0
+argon2-cffi==23.1.0
+cryptography==43.0.3
+PyMySQL==1.1.1
+psycopg2-binary==2.9.10  # not used by app.py today but harmless
+SQLAlchemy==2.0.36
+requests==2.32.3
+PyYAML==6.0.2

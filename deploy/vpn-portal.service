@@ -1,0 +1,48 @@
+[Unit]
+Description=databyte VPN Portal — FastAPI backend (v2.x)
+Documentation=file:///opt/vpn-portal/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=notify
+User=vpn-portal
+Group=vpn-portal
+SupplementaryGroups=docker
+WorkingDirectory=/opt/vpn-portal
+EnvironmentFile=/etc/vpn-portal.env
+ExecStart=/opt/vpn-portal/.venv/bin/gunicorn app:app \
+  --worker-class uvicorn.workers.UvicornWorker \
+  --workers 4 \
+  --bind unix:/run/vpn-portal/gunicorn.sock \
+  --timeout 120 \
+  --graceful-timeout 30 \
+  --max-requests 1000 \
+  --max-requests-jitter 50 \
+  --access-logfile - \
+  --error-logfile -
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/run/vpn-portal /var/log/vpn-portal /var/lib/strongswan
+RuntimeDirectory=vpn-portal
+RuntimeDirectoryMode=0750
+MemoryMax=512M
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpn-portal
+
+[Install]
+WantedBy=multi-user.target

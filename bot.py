@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -211,6 +212,19 @@ RW_EAP_CONF = os.environ.get(
     "/opt/strongswan-vpn-gateway/docker/swanctl/conf.d/rw-eap.conf",
 )
 
+# Feature flag: block user for N seconds after Disconnect-Request. Layered
+# block via two independent mechanisms (so either alone would defeat Android's
+# auto-reconnect, both together is bulletproof):
+#   1. INSERT radcheck row (username, 'Auth-Type', ':=', 'Reject') — checked
+#      BEFORE password attrs in FreeRADIUS authorize section, so Access-Reject
+#      is immediate regardless of stored credentials.
+#   2. iptables -I INPUT -s <calling_station_id> -p udp --dport 500,4500 -j
+#      DROP — Android client can't even reach charon to retry EAP.
+# Both layers revert via threading.Timer after block_seconds.
+# Set DISCONNECT_BLOCK_SECONDS=N (e.g. 300 = 5 min) on prod to enable.
+# Default 0 = disabled (preserves existing behavior).
+DISCONNECT_BLOCK_SECONDS = int(os.environ.get("DISCONNECT_BLOCK_SECONDS", "0"))
+
 logger = logging.getLogger("vpn-bot")
 
 
@@ -224,6 +238,227 @@ def audit(action: str, **details):
             f.write(line)
     except Exception as e:
         logger.error(f"audit log write failed: {e}")
+
+
+def _block_user(eap_identity: str, source_ip: str, block_seconds: int) -> None:
+    """Block user via two independent layers for N seconds.
+
+    Option 2 (TKT-030): direct pymysql + iptables subprocess with check=True.
+    Replaces the earlier SQLAlchemy _db()/app.db_exec path which had a
+    connection-pool visibility bug on the LXC 909 dry run (INSERT was
+    committed inside the worker process but invisible to other mariadb
+    sessions). Direct pymysql.connect() bypasses the pool entirely.
+
+    Layer 1 (RADIUS): INSERT radcheck row (username, 'Auth-Type', ':=', 'Reject').
+    FreeRADIUS checks Auth-Type BEFORE password attrs in the authorize
+    section, so Access-Reject is immediate regardless of stored creds.
+
+    Layer 2 (network): iptables -I INPUT -s <source_ip> -p udp --dport
+    500,4500 -j DROP. Android client can't even reach charon to retry EAP.
+    Uses check=True so iptables errors surface (previously silently failed).
+
+    Either layer alone blocks reconnection; both is bulletproof.
+    Both revert via a single threading.Timer after block_seconds.
+
+    Failures in either layer are logged and don't propagate. The
+    disconnect itself already succeeded; only the block might not apply.
+    """
+    # Parse DB_URL for direct pymysql connection (pattern from rotate_eap_credentials)
+    db_url = os.environ.get("DB_URL", "")
+    # Expected: mysql+pymysql://user:password@host:port/database
+    db_user = db_pass = db_host = db_port = db_name = ""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(db_url)
+        db_user = parsed.username or ""
+        db_pass = parsed.password or ""
+        db_host = parsed.hostname or "127.0.0.1"
+        db_port = str(parsed.port or 3306)
+        db_name = (parsed.path or "/radius").lstrip("/") or "radius"
+    except Exception:
+        pass
+
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=db_host, port=int(db_port),
+            user=db_user, password=db_pass,
+            database=db_name, connect_timeout=5,
+            autocommit=True,  # critical: write is immediately visible
+        )
+        try:
+            with conn.cursor() as cur:
+                # Layer 1: FreeRADIUS Auth-Type=Reject
+                # Uses ? placeholders (pymysql native)
+                cur.execute(
+                    "INSERT INTO radcheck (username, attribute, op, value) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE value=%s",
+                    (eap_identity, "Auth-Type", ":=", "Reject", "Reject"),
+                )
+        finally:
+            conn.close()
+
+        # Layer 2: iptables DROP for source IP (block at network layer).
+        # Uses -I (insert at top) so the rule is evaluated first. Uses
+        # check=True so iptables errors surface instead of silently failing.
+        if source_ip:
+            try:
+                subprocess.run(
+                    [
+                        "iptables", "-I", "INPUT",
+                        "-s", source_ip,
+                        "-p", "udp", "-m", "multiport", "--dports", "500,4500",
+                        "-j", "DROP",
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as ipt_err:
+                logger.warning(
+                    f"_block_user: iptables DROP failed for "
+                    f"{eap_identity}/{source_ip}: {ipt_err.stderr}"
+                )
+            except Exception as ipt_err:
+                logger.warning(
+                    f"_block_user: iptables DROP error for "
+                    f"{eap_identity}/{source_ip}: {ipt_err}"
+                )
+
+        # Schedule revert (one Timer, reverts both layers atomically)
+        threading.Timer(
+            block_seconds,
+            _unblock_user,
+            args=(eap_identity, source_ip),
+        ).start()
+        audit(
+            "disconnect_block",
+            eap_identity=eap_identity,
+            block_seconds=block_seconds,
+            source_ip=source_ip or "none",
+        )
+        logger.info(
+            f"_block_user: {eap_identity} blocked for {block_seconds}s"
+            f"{f' (src IP {source_ip})' if source_ip else ''}"
+        )
+    except Exception as e:
+        logger.warning(f"_block_user: failed to block {eap_identity}: {e}")
+
+
+def _unblock_user(eap_identity: str, source_ip: str) -> None:
+    """Revert the block: DELETE Auth-Type=Reject row + remove iptables DROP rule.
+
+    Option 2 (TKT-030): direct pymysql + iptables subprocess with check=True.
+    Mirrors _block_user's Option 2 pattern. Idempotent: each operation
+    matches what _block_user created, so a partial-block revert is safe.
+
+    Runs on a daemon thread via threading.Timer (one per block, started
+    inside _block_user).
+    """
+    db_url = os.environ.get("DB_URL", "")
+    db_user = db_pass = db_host = db_port = db_name = ""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(db_url)
+        db_user = parsed.username or ""
+        db_pass = parsed.password or ""
+        db_host = parsed.hostname or "127.0.0.1"
+        db_port = str(parsed.port or 3306)
+        db_name = (parsed.path or "/radius").lstrip("/") or "radius"
+    except Exception:
+        pass
+
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=db_host, port=int(db_port),
+            user=db_user, password=db_pass,
+            database=db_name, connect_timeout=5,
+            autocommit=True,
+        )
+        try:
+            with conn.cursor() as cur:
+                # Layer 1 revert: DELETE the Auth-Type=Reject row
+                cur.execute(
+                    "DELETE FROM radcheck "
+                    "WHERE username = %s AND attribute = %s AND value = %s",
+                    (eap_identity, "Auth-Type", "Reject"),
+                )
+        finally:
+            conn.close()
+
+        # Layer 2 revert: remove iptables DROP rule
+        if source_ip:
+            try:
+                subprocess.run(
+                    [
+                        "iptables", "-D", "INPUT",
+                        "-s", source_ip,
+                        "-p", "udp", "-m", "multiport", "--dports", "500,4500",
+                        "-j", "DROP",
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as ipt_err:
+                logger.warning(
+                    f"_unblock_user: iptables -D failed for "
+                    f"{eap_identity}/{source_ip}: {ipt_err.stderr}"
+                )
+            except Exception as ipt_err:
+                logger.warning(
+                    f"_unblock_user: iptables -D error for "
+                    f"{eap_identity}/{source_ip}: {ipt_err}"
+                )
+
+        audit(
+            "disconnect_unblock",
+            eap_identity=eap_identity,
+            source_ip=source_ip or "none",
+        )
+        logger.info(f"_unblock_user: {eap_identity} unblocked")
+    except Exception as e:
+        logger.error(f"_unblock_user: FAILED for {eap_identity}: {e}")
+
+def _startup_recover_orphaned_blocks() -> None:
+    """Clean up any orphaned Auth-Type=Reject rows left by a crashed bot.
+
+    Called once at build_application() startup. In steady state, no
+    Auth-Type=Reject rows should exist — they're removed by _unblock_user
+    Timer after block_seconds. If any are found, they belong to a previous
+    bot session that crashed mid-block — delete them so the user can auth.
+
+    iptables rules are kernel-state and survive bot restart, so they
+    are not cleaned here. (iptables rules inserted via iptables -I are
+    lost on reboot anyway.)
+    """
+    try:
+        import app
+        rows = app.db_query(
+            "SELECT username FROM radcheck "
+            "WHERE attribute = 'Auth-Type' AND value = 'Reject'",
+            (),
+        )
+        for row in rows:
+            username = row["username"]
+            app.db_exec(
+                "DELETE FROM radcheck "
+                "WHERE username = ? AND attribute = 'Auth-Type' "
+                "AND value = 'Reject'",
+                (username,),
+            )
+            audit(
+                "disconnect_block_orphan_recovered",
+                eap_identity=username,
+            )
+            logger.warning(
+                f"startup_recover_orphaned_blocks: restored {username}"
+            )
+    except Exception as e:
+        logger.error(
+            f"startup_recover_orphaned_blocks: query failed: {e}"
+        )
+
 
 
 async def reject_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,21 +612,23 @@ async def cmd_stats(update, context):
 async def cmd_sessions(update, context):
     audit("sessions")
     import app
+    from datetime import datetime, timezone, timedelta
+
     sessions = app.swanctl_parse_sas()
-    if not sessions:
-        await update.message.reply_text("No active sessions.")
-        return
     lines = ["*Active Sessions*"]
-    for s in sessions[:25]:
-        rid = s.get("remote_id") or "?"
-        rip = s.get("remote_ip") or "?"
-        vip = s.get("vip") or "?"
-        st = s.get("state") or "?"
-        bi = s.get("bytes_in", 0)
-        bo = s.get("bytes_out", 0)
-        lines.append(
-            f"- `{rid}` `{rip}` -> `{vip}` `{st}` (in:{bi:,} out:{bo:,})"
-        )
+    if not sessions:
+        lines.append("_No active sessions._")
+    else:
+        for s in sessions[:25]:
+            rid = s.get("remote_id") or "?"
+            rip = s.get("remote_ip") or "?"
+            vip = s.get("vip") or "?"
+            st = s.get("state") or "?"
+            bi = s.get("bytes_in", 0)
+            bo = s.get("bytes_out", 0)
+            lines.append(
+                f"- `{rid}` `{rip}` -> `{vip}` `{st}` (in:{bi:,} out:{bo:,})"
+            )
     # Inline keyboard: one [Disconnect] button per session row.
     # callback_data fits 64-byte Telegram limit ("disc:" + EAP identity).
     keyboard = [
@@ -401,24 +638,89 @@ async def cmd_sessions(update, context):
         )]
         for s in sessions[:25]
     ]
+
+    # NEW: Last 2 recent (closed) sessions, excluding currently-live users.
+    SAST = timezone(timedelta(hours=2))
+    live_usernames = [s.get("remote_id") for s in sessions if s.get("remote_id") and s.get("remote_id") != "?"]
+    recent = app.recent_sessions(limit=2, exclude_usernames=live_usernames)
+    if recent:
+        lines.append("")
+        lines.append("*Last 2 recent*")
+        def fmt_ts(ts):
+            if not ts:
+                return "?"
+            if isinstance(ts, str):
+                ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            ts_utc = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+            return ts_utc.astimezone(SAST).strftime("%Y-%m-%d %H:%M")
+        def fmt_dur(seconds):
+            seconds = int(seconds or 0)
+            if seconds < 60:
+                return f"{seconds}s"
+            m, s = divmod(seconds, 60)
+            if m < 60:
+                return f"{m}m {s}s"
+            h, m = divmod(m, 60)
+            return f"{h}h {m:02d}m"
+        def fmt_bytes(n):
+            n = int(n or 0)
+            if n < 1024:
+                return f"{n} B"
+            if n < 1024**2:
+                return f"{n/1024:.1f} KB"
+            if n < 1024**3:
+                return f"{n/1024**2:.1f} MB"
+            return f"{n/1024**3:.2f} GB"
+        for i, r in enumerate(recent, 1):
+            rname = r.get("UserName") or "?"
+            rip = r.get("FramedIPAddress") or "?"
+            start = r.get("AcctStartTime")
+            stop = r.get("AcctStopTime")
+            dur = r.get("AcctSessionTime") or 0
+            bi = r.get("AcctInputOctets") or 0
+            bo = r.get("AcctOutputOctets") or 0
+            lines.append(f"{i}. `{rname}` · `{rip}`")
+            lines.append(f"   {fmt_ts(start)} → {fmt_ts(stop)} SAST ({fmt_dur(dur)})")
+            lines.append(f"   ↓ {fmt_bytes(bi)} / {fmt_bytes(bo)}")
+    else:
+        lines.append("")
+        lines.append("_No history yet._")
+
     await update.message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
     )
 
 
 async def cmd_customers(update, context):
     audit("customers")
     import app
+    from datetime import datetime, timezone, timedelta
+    SAST = timezone(timedelta(hours=2))
+
     rows = app.db_query(
-        "SELECT id, name, display_name, is_active "
+        "SELECT id, name, display_name, is_active, created_at, last_session_at "
         "FROM customers WHERE COALESCE(is_operator, 0) = 0 ORDER BY id"
     )
     if not rows:
         await update.message.reply_text("No customers.")
         return
-    lines = ["*Customers*"]
+
+    def fmt_created(ts):
+        if not ts:
+            return "?"
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(SAST).strftime("%Y-%m-%d")
+
+    def fmt_last_session(ts):
+        if not ts:
+            return "never"
+        if isinstance(ts, str):
+            ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        ts_utc = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+        return ts_utc.astimezone(SAST).strftime("%Y-%m-%d %H:%M") + " SAST"
+
+    lines = ["*Customers*", ""]
     for c in rows:
         archived = bool(c.get("is_archived"))
         active = bool(c.get("is_active"))
@@ -428,9 +730,10 @@ async def cmd_customers(update, context):
             flag = "G"  # green active
         else:
             flag = "R"  # red disabled
-        lines.append(
-            f"[{flag}] `{c['id']}` `{c['name']}` - {c.get('display_name') or ''}"
-        )
+        name_disp = c.get("display_name") or ""
+        lines.append(f"[{flag}] `{c['id']}` `{c['name']}` - {name_disp}")
+        lines.append(f"Created: {fmt_created(c.get('created_at'))} · Last session: {fmt_last_session(c.get('last_session_at'))}")
+        lines.append("------")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -981,7 +1284,7 @@ async def cmd_enable(update, context):
     await update.message.reply_text(f"Enabled customer id=`{cid}`.")
 
 
-def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
+def disconnect_via_coa(eap_identity: str, block_seconds: int = 0) -> tuple[bool, str]:
     """Send a Disconnect-Request to charon's DAE plugin (UDP 127.0.0.1:3799).
 
     Shared between /disconnect (typed) and cb_disconnect (inline button).
@@ -1003,6 +1306,11 @@ def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
       code 40), NOT "coa" (CoA-Request, code 43). charon's DAE
       just NAKs CoA-Request without processing it. quota-monitor.py
       uses the same Disconnect-Request + Acct-Session-Id pattern.
+    - If block_seconds > 0, ALSO inserts an Auth-Type=Reject row in
+      radcheck (immediate Access-Reject at FreeRADIUS layer) and adds
+      an iptables DROP rule for the source IP (blocks UDP 500/4500 at
+      network layer). Both layers revert via threading.Timer after
+      block_seconds. See _block_user docstring.
 
     Sync subprocess blocks the event loop briefly (~10s max) — acceptable
     for an admin tool with infrequent disconnects.
@@ -1010,16 +1318,20 @@ def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
     if not eap_identity or eap_identity == "?":
         return False, "Invalid EAP identity (empty or '?'). Button data malformed."
     secret = "b305c63a5010d2c309e29df7bab0fe66"
+    calling_station_id = ""
 
     # Build attributes for charon DAE matching. Start with User-Name
     # (charon uses it for the audit log entry, even if it doesn't match
-    # the IKE_SA). Then look up Acct-Session-Id + Framed-IP-Address
-    # from radacct where the session is still active (acctstoptime IS NULL).
+    # the IKE_SA). Then look up Acct-Session-Id + Framed-IP-Address +
+    # Calling-Station-Id from radacct where the session is still active
+    # (acctstoptime IS NULL). Calling-Station-Id is used by the block
+    # layer (iptables DROP) but NOT by charon DAE (which only matches
+    # on Acct-Session-Id OR Framed-IP-Address).
     attrs = [f"User-Name={eap_identity}"]
     try:
         import app
         rows = app.db_query(
-            "SELECT acctsessionid, framedipaddress FROM radacct "
+            "SELECT acctsessionid, framedipaddress, callingstationid FROM radacct "
             "WHERE username = %s AND acctstoptime IS NULL "
             "ORDER BY acctstarttime DESC LIMIT 1",
             (eap_identity,),
@@ -1030,9 +1342,12 @@ def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
                 attrs.append(f"Acct-Session-Id={row['acctsessionid']}")
             if row.get("framedipaddress"):
                 attrs.append(f"Framed-IP-Address={row['framedipaddress']}")
+            calling_station_id = row.get("callingstationid", "") or ""
             logger.info(
                 f"disconnect_via_coa: {eap_identity} -> "
-                f"session_id={row.get('acctsessionid')!r} vip={row.get('framedipaddress')!r}"
+                f"session_id={row.get('acctsessionid')!r} "
+                f"vip={row.get('framedipaddress')!r} "
+                f"src_ip={calling_station_id!r}"
             )
         else:
             logger.warning(f"disconnect_via_coa: no active radacct row for {eap_identity!r} (will NAK)")
@@ -1048,6 +1363,29 @@ def disconnect_via_coa(eap_identity: str) -> tuple[bool, str]:
             text=True,
             timeout=10,
         )
+        if res.returncode == 0 and block_seconds > 0:
+            # Two-layer block: Auth-Type=Reject (RADIUS) + iptables DROP
+            # (network). Either alone would defeat Android's auto-reconnect;
+            # both together is bulletproof. See _block_user docstring.
+            try:
+                _block_user(eap_identity, calling_station_id, block_seconds)
+                src_note = (
+                    f" (src IP {calling_station_id})"
+                    if calling_station_id else ""
+                )
+                return True, (
+                    f"Disconnect sent + user blocked for {block_seconds}s"
+                    f"{src_note} (Auth-Type=Reject + iptables DROP, "
+                    f"both revert in {block_seconds}s)."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"disconnect_via_coa: failed to block "
+                    f"{eap_identity} after disconnect: {e}"
+                )
+                # Fall through — disconnect itself succeeded, only
+                # the block didn't apply.
+
         if res.returncode == 0:
             return True, f"Disconnect sent for `{eap_identity}`."
         # Non-zero exit. Capture stderr (preferred) or stdout for the cause.
@@ -1079,7 +1417,7 @@ async def cmd_disconnect(update, context):
         await update.message.reply_text(f"No customer matches `{arg}`.")
         return
     eap_identity = rows[0]["eap_identity"]
-    ok, msg = disconnect_via_coa(eap_identity)
+    ok, msg = disconnect_via_coa(eap_identity, block_seconds=DISCONNECT_BLOCK_SECONDS)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1093,44 +1431,43 @@ async def cb_disconnect(update, context):
     parts = query.data.split(":", 1)
     eap_identity = parts[1] if len(parts) > 1 else ""
     audit("disconnect_inline", eap_identity=eap_identity)
-    ok, msg = disconnect_via_coa(eap_identity)
+    ok, msg = disconnect_via_coa(eap_identity, block_seconds=DISCONNECT_BLOCK_SECONDS)
     # Edit the original message so the button disappears after action.
     await _safe_edit_text(query, msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_logs(update, context):
-    if not context.args:
-        await update.message.reply_text("Usage: /logs <name> [n=20]")
+    if context.args:
+        await update.message.reply_text("Usage: /logs")
         return
-    name = context.args[0]
-    n = 20
-    if len(context.args) > 1 and context.args[1].isdigit():
-        n = int(context.args[1])
-    audit("logs", name=name, n=n)
+    audit("logs")
     import app
-
-    rows = app.db_query("SELECT user_id FROM customers WHERE name = ?", (name,))
-    eap_id = name
-    if rows and rows[0].get("user_id"):
-        u = app.db_query("SELECT name FROM users WHERE id = ?", (rows[0]["user_id"],))
-        if u:
-            eap_id = u[0]["name"]
+    from datetime import datetime, timezone, timedelta
+    SAST = timezone(timedelta(hours=2))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).replace(tzinfo=None)
 
     auths = app.db_query(
-        "SELECT authdate, reply, class "
-        "FROM radpostauth WHERE username = ? "
-        "ORDER BY authdate DESC LIMIT ?",
-        (eap_id, n),
+        "SELECT authdate, username, reply "
+        "FROM radpostauth "
+        "WHERE authdate >= ? "
+        "ORDER BY authdate DESC LIMIT 30",
+        (cutoff,),
     )
     if not auths:
-        await update.message.reply_text(f"No auth events for `{eap_id}`.")
+        await update.message.reply_text("No auth events in the last 7 days.")
         return
-    lines = [f"*Last {len(auths)} auth events for `{eap_id}`*"]
+    lines = [f"*Recent Logs* (last {len(auths)}, last 7d)", ""]
     for r in auths:
-        lines.append(
-            f"`{r['authdate']}` {r['reply']} "
-            f"class=`{r.get('class') or '-'}`"
-        )
+        ad = r.get("authdate")
+        if isinstance(ad, str):
+            ad = datetime.strptime(ad, "%Y-%m-%d %H:%M:%S")
+        if ad.tzinfo is None:
+            ad = ad.replace(tzinfo=timezone.utc)
+        ad_sast = ad.astimezone(SAST).strftime("%Y-%m-%d %H:%M")
+        reply = r.get("reply") or "?"
+        icon = "\u2705" if "Accept" in reply else "\u274c"
+        user = r.get("username") or "?"
+        lines.append(f"{ad_sast} SAST \u00b7 {icon} `{user}` \u00b7 {reply}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1138,6 +1475,10 @@ async def cmd_logs(update, context):
 
 def build_application() -> Application:
     from urllib.parse import urlparse
+
+    # Recover any orphaned block markers from a previous bot crash
+    # (see _startup_recover_orphaned_blocks docstring).
+    _startup_recover_orphaned_blocks()
     from bot_persistence import MariaDBPersistence
 
     # Parse DB connection from /etc/vpn-portal.env DB_URL.

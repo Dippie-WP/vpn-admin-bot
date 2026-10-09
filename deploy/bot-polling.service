@@ -1,0 +1,20 @@
+[Unit]
+Description=VPN Portal Telegram Bot - Polling Service
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/vpn-portal
+EnvironmentFile=/etc/vpn-portal.env
+Environment="PATH=/opt/vpn-portal/.venv/bin:/usr/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/vpn-portal/.venv/bin/python3 /opt/vpn-portal/bot_polling.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

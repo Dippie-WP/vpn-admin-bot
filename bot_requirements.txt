@@ -1,0 +1,4 @@
+# Telegram bot deps (bot.py only — extends requirements.txt).
+# python-telegram-bot v22.x = async, polling/webhook both supported.
+
+python-telegram-bot[ext]==22.0
