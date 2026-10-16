@@ -920,8 +920,9 @@ def slugify(s: str) -> str:
 # Operator picks the speed plan at customer creation; explicit bandwidth_*
 # overrides win.
 SPEED_PLANS = {
-    "standard":         {"bandwidth_down_mbps": 20, "bandwidth_up_mbps": 20},
-    "asymmetric_40_20": {"bandwidth_down_mbps": 40, "bandwidth_up_mbps": 20},
+    "lite":     {"bandwidth_down_mbps": 10, "bandwidth_up_mbps": 10},
+    "standard": {"bandwidth_down_mbps": 20, "bandwidth_up_mbps": 20},
+    "pro":      {"bandwidth_down_mbps": 40, "bandwidth_up_mbps": 20},
 }
 
 
@@ -994,7 +995,7 @@ class ClientCreate(BaseModel):
     #   'asymmetric_40_20'   → 40 mbps down / 20 mbps up
     # Precedence: explicit bandwidth_down_mbps / bandwidth_up_mbps (below) wins.
     # If both omitted → defaults to 'standard'.
-    speed_plan:       Optional[Literal["standard", "asymmetric_40_20"]] = Field(
+    speed_plan:       Optional[Literal["lite", "standard", "pro"]] = Field(
         None,
         description="Per-customer bandwidth preset. 'standard' (20/20) or 'asymmetric_40_20' (40/20). "
                     "If both speed_plan and explicit bandwidth_* are provided, explicit wins."
@@ -1332,8 +1333,14 @@ def create_client(req: ClientCreate, _user: dict = Depends(require_session)):
     if req.mac_address_2 and not MAC_RE.match(req.mac_address_2):
         raise HTTPException(400, f"mac_address_2 '{req.mac_address_2}' is not a valid MAC (XX:XX:XX:XX:XX:XX)")
 
-    if req.device_type not in ALLOWED_DEVICE_TYPES:
-        raise HTTPException(400, f"device_type must be one of {sorted(ALLOWED_DEVICE_TYPES)}")
+    # Case-insensitive check: the bot uppercases device_type before sending.
+    # Normalize both sides to upper for comparison, but preserve the bot's
+    # value in the DB (the ALLOWED_DEVICE_TYPES set uses title case for display).
+    if req.device_type.upper() not in {d.upper() for d in ALLOWED_DEVICE_TYPES}:
+        raise HTTPException(
+            400,
+            f"device_type must be one of {sorted(ALLOWED_DEVICE_TYPES)} (case-insensitive)"
+        )
 
     if not DEVICE_NAME_RE.match(req.device_name):
         raise HTTPException(400, "device_name must be alphanumeric + dash, 1-32 chars, no leading dash")
@@ -2405,7 +2412,7 @@ class CustomerUpdate(BaseModel):
     # Precedence (consistent with ClientCreate): explicit bandwidth_* > speed_plan.
     # If only speed_plan provided, it resolves to bandwidth_* via resolve_bandwidth().
     # If neither provided, bandwidth_* columns are NOT touched.
-    speed_plan:        Optional[Literal["standard", "asymmetric_40_20", "custom"]] = None
+    speed_plan:        Optional[Literal["lite", "standard", "pro", "custom"]] = None
     bandwidth_down_mbps: Optional[int] = None  # 1..1000 (5D per-customer bandwidth)
     bandwidth_up_mbps:   Optional[int] = None  # 1..1000 (5D per-customer bandwidth)
 
